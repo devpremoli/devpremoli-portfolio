@@ -29,7 +29,7 @@ export default function Navbar() {
       <nav className="mx-auto max-w-6xl flex items-center justify-between px-6 py-4">
         <a href="#home" className="text-xl font-bold tracking-tight">
           <span className="text-crimson">&lt;</span>
-          Prem
+          devpremoli
           <span className="text-navy-light"> /</span>
           <span className="text-crimson">&gt;</span>
         </a>

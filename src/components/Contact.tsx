@@ -13,12 +13,28 @@ export default function Contact() {
     email: "",
     message: "",
   });
+  const [status, setStatus] = useState<"idle" | "submitting" | "success" | "error">("idle");
 
-  const handleSubmit = (e: FormEvent) => {
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    // Connect to your form backend (e.g., Formspree, EmailJS)
-    const mailto = `mailto:${siteConfig.email}?subject=Portfolio Contact from ${formState.name}&body=${encodeURIComponent(formState.message)}%0A%0AFrom: ${formState.email}`;
-    window.open(mailto);
+    setStatus("submitting");
+
+    try {
+      const res = await fetch("https://formspree.io/f/mjgpgjgr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(formState),
+      });
+
+      if (res.ok) {
+        setStatus("success");
+        setFormState({ name: "", email: "", message: "" });
+      } else {
+        setStatus("error");
+      }
+    } catch {
+      setStatus("error");
+    }
   };
 
   return (
@@ -112,6 +128,7 @@ export default function Contact() {
                   <input
                     type="text"
                     id="name"
+                    name="name"
                     required
                     value={formState.name}
                     onChange={(e) =>
@@ -131,6 +148,7 @@ export default function Contact() {
                   <input
                     type="email"
                     id="email"
+                    name="email"
                     required
                     value={formState.email}
                     onChange={(e) =>
@@ -150,6 +168,7 @@ export default function Contact() {
                 </label>
                 <textarea
                   id="message"
+                  name="message"
                   required
                   rows={5}
                   value={formState.message}
@@ -162,12 +181,25 @@ export default function Contact() {
               </div>
               <motion.button
                 type="submit"
+                disabled={status === "submitting"}
                 whileHover={{ scale: 1.02 }}
                 whileTap={{ scale: 0.98 }}
-                className="w-full sm:w-auto px-8 py-3.5 bg-crimson hover:bg-crimson-dark text-white font-medium rounded-full transition-colors flex items-center justify-center gap-2 hover:shadow-lg hover:shadow-crimson/25"
+                className="w-full sm:w-auto px-8 py-3.5 bg-crimson hover:bg-crimson-dark text-white font-medium rounded-full transition-colors flex items-center justify-center gap-2 hover:shadow-lg hover:shadow-crimson/25 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                <FaPaperPlane className="text-sm" /> Send Message
+                <FaPaperPlane className="text-sm" />
+                {status === "submitting" ? "Sending..." : "Send Message"}
               </motion.button>
+
+              {status === "success" && (
+                <p className="text-green-400 text-sm mt-3">
+                  Message sent successfully! I&apos;ll get back to you soon.
+                </p>
+              )}
+              {status === "error" && (
+                <p className="text-red-400 text-sm mt-3">
+                  Something went wrong. Please try again or email me directly.
+                </p>
+              )}
             </form>
           </AnimatedSection>
         </div>
