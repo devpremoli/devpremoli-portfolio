@@ -1,0 +1,127 @@
+Event-driven architecture is the backbone of modern distributed systems. Over the past few years, I've built several high-throughput event pipelines with Apache Kafka and Spring Boot. Here's what I've learned.
+
+## Why Event-Driven?
+
+Traditional request-response architectures create tight coupling between services. When Service A calls Service B synchronously, both must be available at the same time. Event-driven architecture decouples producers from consumers:
+
+- **Loose coupling** — services communicate through events, not direct calls
+- **Scalability** — consumers can scale independently based on load
+- **Resilience** — if a consumer goes down, events are retained in Kafka until it recovers
+- **Audit trail** — Kafka's log is an immutable record of everything that happened
+
+## Setting Up Kafka with Spring Boot
+
+Spring Boot's Kafka integration is mature and well-documented. Here's a basic producer setup:
+
+```java
+@Service
+public class OrderEventProducer {
+
+    private final KafkaTemplate<String, OrderEvent> kafkaTemplate;
+
+    public CompletableFuture<SendResult<String, OrderEvent>> publish(
+            OrderEvent event) {
+        return kafkaTemplate.send(
+            "orders",
+            event.getOrderId(),
+            event
+        );
+    }
+}
+```
+
+Key design decisions here: using the order ID as the partition key ensures all events for the same order land in the same partition — preserving ordering guarantees.
+
+## Schema Evolution with Avro
+
+One of the biggest challenges in event-driven systems is schema evolution. What happens when you need to add a field to an event?
+
+Avro with Schema Registry solves this:
+
+```avro
+{
+  "type": "record",
+  "name": "OrderEvent",
+  "namespace": "com.example.events",
+  "fields": [
+    {"name": "orderId", "type": "string"},
+    {"name": "amount", "type": "double"},
+    {"name": "currency", "type": "string", "default": "USD"},
+    {"name": "metadata", "type": ["null", "string"], "default": null}
+  ]
+}
+```
+
+The rules are simple: you can add fields with defaults, but you can't remove required fields or change types. Schema Registry enforces these rules at the broker level.
+
+## Exactly-Once Semantics
+
+"Exactly once" is the holy grail of message processing. Kafka supports it through idempotent producers and transactional consumers:
+
+```java
+@Configuration
+public class KafkaConfig {
+
+    @Bean
+    public ProducerFactory<String, OrderEvent> producerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "order-tx-");
+        return new DefaultKafkaProducerFactory<>(props);
+    }
+}
+```
+
+But exactly-once within Kafka isn't enough — you also need exactly-once between Kafka and your database. The **transactional outbox pattern** handles this: write to your database and an outbox table in the same transaction, then publish events from the outbox.
+
+## Dead Letter Queues
+
+Not every message can be processed. Poison pills, schema mismatches, or transient failures need a safety net:
+
+```java
+@Bean
+public ConcurrentKafkaListenerContainerFactory<String, OrderEvent>
+        kafkaListenerContainerFactory() {
+
+    var factory = new ConcurrentKafkaListenerContainerFactory<>();
+    factory.setCommonErrorHandler(
+        new DefaultErrorHandler(
+            new DeadLetterPublishingRecoverer(kafkaTemplate),
+            new FixedBackOff(1000L, 3)
+        )
+    );
+    return factory;
+}
+```
+
+This retries 3 times with 1-second backoff, then sends failed messages to a dead letter topic for investigation.
+
+## Resilience with Resilience4j
+
+Kafka consumers often call downstream services. Protect those calls with circuit breakers:
+
+```java
+@CircuitBreaker(name = "inventory", fallbackMethod = "fallback")
+@Retry(name = "inventory")
+public InventoryResponse reserveInventory(OrderEvent event) {
+    return inventoryClient.reserve(event.getItems());
+}
+```
+
+When the downstream service is struggling, the circuit breaker opens and fails fast instead of adding to the pile.
+
+## Monitoring and Observability
+
+In production, you need visibility into:
+
+- **Consumer lag** — how far behind are your consumers?
+- **Throughput** — messages per second per partition
+- **Error rates** — dead letter queue growth
+- **Processing latency** — time from produce to consume
+
+We use Prometheus + Grafana with Spring Boot Actuator's Kafka metrics to monitor all of this.
+
+---
+
+Event-driven architecture with Kafka is powerful but demands careful design around schemas, delivery guarantees, error handling, and monitoring. Get these right, and you have a system that scales gracefully and recovers from failures automatically.

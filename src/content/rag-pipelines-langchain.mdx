@@ -1,0 +1,102 @@
+Retrieval-Augmented Generation (RAG) has become the go-to pattern for building LLM-powered applications that need access to domain-specific knowledge. In this post, I'll walk through building a production-grade RAG pipeline using LangChain and vector databases.
+
+## Why RAG?
+
+Large Language Models are powerful, but they have limitations:
+
+- **Knowledge cutoff** — they don't know about events after their training data
+- **Hallucinations** — they can confidently generate incorrect information
+- **No access to private data** — they can't query your internal documents
+
+RAG solves these problems by retrieving relevant context from your own data and injecting it into the LLM's prompt before generating a response.
+
+## Architecture Overview
+
+A typical RAG pipeline has three stages:
+
+1. **Ingestion** — Load documents, chunk them, generate embeddings, and store in a vector database
+2. **Retrieval** — Given a user query, find the most semantically similar chunks
+3. **Generation** — Pass retrieved chunks as context to the LLM to generate an answer
+
+## Document Chunking Strategy
+
+Chunking is one of the most critical decisions in a RAG pipeline. Too large and you lose precision; too small and you lose context.
+
+I've found that **recursive character splitting** with overlapping windows works well for most use cases:
+
+```python
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    separators=["\n\n", "\n", ". ", " ", ""]
+)
+
+chunks = splitter.split_documents(documents)
+```
+
+The overlap ensures that context isn't lost at chunk boundaries.
+
+## Embedding and Vector Storage
+
+For embeddings, I use models from Hugging Face that run locally — no API calls needed for sensitive enterprise data:
+
+```python
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import Chroma
+
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+vectorstore = Chroma.from_documents(
+    documents=chunks,
+    embedding=embeddings,
+    persist_directory="./chroma_db"
+)
+```
+
+## Retrieval with Semantic Search
+
+The retriever converts the user's question into an embedding and finds the closest matches:
+
+```python
+retriever = vectorstore.as_retriever(
+    search_type="mmr",  # Maximal Marginal Relevance
+    search_kwargs={"k": 5, "fetch_k": 20}
+)
+```
+
+MMR balances relevance with diversity — you don't want five chunks that all say the same thing.
+
+## Putting It All Together
+
+With LangChain, the full pipeline is a chain:
+
+```python
+from langchain.chains import RetrievalQA
+from langchain.llms import OpenAI
+
+qa_chain = RetrievalQA.from_chain_type(
+    llm=OpenAI(temperature=0),
+    chain_type="stuff",
+    retriever=retriever,
+    return_source_documents=True
+)
+
+result = qa_chain.invoke({"query": "What is our refund policy?"})
+```
+
+## Lessons from Production
+
+After deploying RAG pipelines in enterprise settings, here are the key takeaways:
+
+- **Chunk size matters more than embedding model choice** — experiment with different sizes for your domain
+- **Metadata filtering is essential** — tag chunks with source, date, and category for filtered retrieval
+- **Evaluation is hard but necessary** — use frameworks like RAGAS to measure retrieval quality
+- **Cache aggressively** — embedding the same document twice is wasted compute
+
+---
+
+RAG is a powerful pattern, but it's not magic. The quality of your pipeline depends on thoughtful chunking, good embeddings, and careful evaluation. Start simple, measure everything, and iterate.

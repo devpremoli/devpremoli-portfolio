@@ -1,0 +1,67 @@
+Six years into my software engineering career, I want to share some of the lessons I've picked up building distributed systems across very different industries — finance, healthcare, and telecom.
+
+## Starting in Finance
+
+My first major engineering role was at HSBC, working on transaction processing systems. Banking taught me that **correctness is non-negotiable**. When you're processing millions of dollars in settlements, "eventually consistent" isn't good enough.
+
+I learned to think deeply about:
+
+- **Transaction isolation levels** — what happens when two operations touch the same account?
+- **Idempotency** — if a payment request is retried, it should not be charged twice
+- **Audit trails** — every state change must be traceable
+
+Spring Batch became my workhorse for high-volume batch processing. We'd process millions of transactions nightly, and the framework's restart, skip, and retry capabilities were essential.
+
+## Scaling in Healthcare
+
+At Cardinal Health, the challenge shifted from financial correctness to **data interoperability**. Healthcare systems speak HL7 and FHIR — standards that are powerful but complex.
+
+The key lesson here was building reliable integrations between systems that don't natively talk to each other. Event-driven patterns with AWS Lambda, S3, and SNS/SQS became the glue.
+
+Healthcare also reinforced the importance of **security and compliance**. HIPAA isn't just a checkbox — it fundamentally shapes how you design data flows, access controls, and audit logging.
+
+## Investing in Quality at Fidelity
+
+At Fidelity Investments, I worked on portfolio valuation systems that needed to calculate real-time positions across thousands of accounts. The challenge was **performance under load**.
+
+During high market-volume windows, our services needed to process massive parallel calculations. Java's `CompletableFuture` and careful thread pool management were critical:
+
+```java
+List<CompletableFuture<Valuation>> futures = accounts.stream()
+    .map(account -> CompletableFuture.supplyAsync(
+        () -> calculateValuation(account),
+        executorService
+    ))
+    .toList();
+
+CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+```
+
+This is where I also started working with Python and FastAPI for ML-adjacent services — fraud risk scoring models that needed low-latency inference endpoints.
+
+## Telecom and the Scale Problem
+
+Comcast was a different beast. Subscriber-scale means millions of users, and the systems need to handle that volume with low latency. This is where I deepened my experience with:
+
+- **gRPC for inter-service communication** — binary protocol, strongly typed, much faster than REST for internal services
+- **GraphQL for frontend APIs** — let the UI request exactly what it needs
+- **Spring Cloud microservices** — service discovery, config server, API gateway
+- **ETL at scale** — AWS Glue + PySpark for processing terabytes of subscriber data
+
+The biggest lesson from telecom: **observability is not optional at scale**. You can't debug a distributed system with print statements. Distributed tracing, structured logging, and metrics are table stakes.
+
+## What I've Learned Along the Way
+
+Looking back, a few principles have served me well across every domain:
+
+1. **Understand the domain before writing code** — the best technical solution is useless if it doesn't solve the actual business problem
+2. **Design for failure** — distributed systems fail in creative ways. Circuit breakers, retries with backoff, dead letter queues, and graceful degradation aren't premature optimization — they're requirements
+3. **Keep it simple until you can't** — don't reach for Kafka when a database queue will do. Don't build microservices when a well-structured monolith would work. Complexity has a cost
+4. **Invest in testing** — integration tests that hit real databases and message brokers catch bugs that unit tests with mocks never will
+5. **Stay curious** — the field moves fast. LLMs, RAG pipelines, and vector databases weren't in my toolkit two years ago. Now they're central to my work at Paycom
+
+---
+
+Every industry teaches you something different. Finance teaches correctness. Healthcare teaches interoperability. Telecom teaches scale. The common thread is building systems that are reliable, maintainable, and designed to evolve.
+
+I'm excited about what comes next — especially at the intersection of AI and enterprise engineering. The tools are getting more powerful, and the problems are getting more interesting.
