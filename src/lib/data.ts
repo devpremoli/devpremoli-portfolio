@@ -7,7 +7,7 @@ export const siteConfig = {
   phone: "214-519-9096",
   github: "https://github.com/devpremoli",
   linkedin: "https://www.linkedin.com/in/premthedev/",
-  twitter: "#",
+  twitter: "https://x.com/devpremoli",
 };
 
 export const navLinks = [
