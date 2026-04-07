@@ -1,127 +1,224 @@
-Event-driven architecture is the backbone of modern distributed systems. Over the past few years, I've built several high-throughput event pipelines with Apache Kafka and Spring Boot. Here's what I've learned.
+I have been building event driven systems with Apache Kafka for the better part of five years now, across three different companies and two very different industries. In that time I have made just about every mistake you can make with Kafka, and I have slowly accumulated a set of patterns that actually hold up in production. This post is my attempt to write down what I wish somebody had told me when I started.
 
-## Why Event-Driven?
+This is not a "getting started with Kafka" post. There are plenty of those, and Confluent's documentation is excellent. This is a post about the things you only learn after the third 2 AM page, the kind of details that turn a working Kafka prototype into something you would trust with real money or real subscribers.
 
-Traditional request-response architectures create tight coupling between services. When Service A calls Service B synchronously, both must be available at the same time. Event-driven architecture decouples producers from consumers:
+## Why event driven, really
 
-- **Loose coupling** — services communicate through events, not direct calls
-- **Scalability** — consumers can scale independently based on load
-- **Resilience** — if a consumer goes down, events are retained in Kafka until it recovers
-- **Audit trail** — Kafka's log is an immutable record of everything that happened
+I want to spend a minute on the "why," because I think a lot of teams adopt Kafka for the wrong reasons and then are surprised when it does not solve their problems.
 
-## Setting Up Kafka with Spring Boot
+The reason to adopt event driven architecture is *not* "we want to use Kafka." The reason is that you have services that need to react to things happening in other services, and you want those reactions to be:
 
-Spring Boot's Kafka integration is mature and well-documented. Here's a basic producer setup:
+- **Loosely coupled**, so that the producer does not need to know who is listening, and a new consumer can be added without redeploying the producer.
+- **Asynchronous**, so that the producer is not blocked waiting for every consumer to finish.
+- **Durable**, so that if a consumer is down for an hour, the events are still there when it comes back.
+- **Replayable**, so that you can spin up a new consumer and have it process the entire history from the beginning.
+- **Auditable**, because the log itself is an immutable record of what happened.
+
+Kafka gives you all of those properties out of the box, which is why it has become the default. But notice that none of those properties are "low latency" or "easy to operate." Kafka is fast, but it is not the fastest message broker, and it is definitely not the easiest to run. If you do not need durability, replay, or fan out, you might be better off with a database queue or RabbitMQ. Pick the boring option that fits, and only graduate to Kafka when you actually need it.
+
+## A producer is more than `kafkaTemplate.send`
+
+The first time I shipped a Kafka producer, I wrote something that looked roughly like this:
 
 ```java
 @Service
 public class OrderEventProducer {
-
     private final KafkaTemplate<String, OrderEvent> kafkaTemplate;
 
-    public CompletableFuture<SendResult<String, OrderEvent>> publish(
-            OrderEvent event) {
-        return kafkaTemplate.send(
-            "orders",
-            event.getOrderId(),
-            event
-        );
+    public void publish(OrderEvent event) {
+        kafkaTemplate.send("orders", event.getOrderId(), event);
     }
 }
 ```
 
-Key design decisions here: using the order ID as the partition key ensures all events for the same order land in the same partition — preserving ordering guarantees.
+This works, in the sense that messages mostly arrive on the topic. It also has at least four production bugs hidden in it. Let me walk through them.
 
-## Schema Evolution with Avro
+**Bug one: fire and forget.** `KafkaTemplate.send` returns a `CompletableFuture` that I am throwing away. If the broker is unreachable, my code will happily return success and the message will be lost. The fix is to either wait for the future or attach a callback that handles failures:
 
-One of the biggest challenges in event-driven systems is schema evolution. What happens when you need to add a field to an event?
+```java
+public CompletableFuture<SendResult<String, OrderEvent>> publish(OrderEvent event) {
+    return kafkaTemplate.send("orders", event.getOrderId(), event)
+        .whenComplete((result, ex) -> {
+            if (ex != null) {
+                log.error("Failed to publish order event {}", event.getOrderId(), ex);
+                metrics.counter("kafka.publish.failed", "topic", "orders").increment();
+            }
+        });
+}
+```
 
-Avro with Schema Registry solves this:
+**Bug two: no idempotence.** By default, the producer can retry on a transient failure, and a retry can produce a duplicate. The fix is one config flag, but you have to know to set it:
 
-```avro
+```yaml
+spring:
+  kafka:
+    producer:
+      properties:
+        enable.idempotence: true
+        acks: all
+        max.in.flight.requests.per.connection: 5
+```
+
+With idempotence enabled, the broker deduplicates retries based on producer ID and sequence number. You should turn this on for almost every producer. The cost is negligible.
+
+**Bug three: no transactional outbox.** This one is the big one. Even with idempotent producers, you still have a dual write problem: what if your database commit succeeds but the Kafka publish fails? Or vice versa? Your database and your event log are now out of sync, and there is no way to recover automatically.
+
+The fix is the **transactional outbox pattern**. Instead of writing to the database and then publishing to Kafka, you write to the database and to an `outbox` table in the *same database transaction*. A separate process reads from the outbox table and publishes to Kafka, marking rows as published as it goes:
+
+```java
+@Transactional
+public void placeOrder(Order order) {
+    orderRepository.save(order);
+    outboxRepository.save(OutboxEvent.from(order, "OrderPlaced"));
+}
+```
+
+Now the database commit is the source of truth. If the publisher crashes, the rows are still in the outbox and will be published when it restarts. If you want to get fancy, you can use Debezium to stream the outbox table directly into Kafka via change data capture, eliminating the polling loop entirely.
+
+**Bug four: partitioning by the wrong key.** I used `order.getOrderId()` as the partition key, which means every order goes to a (probably) different partition. That is fine if my consumers do not care about ordering. But if I have a consumer that needs to see "OrderPlaced" before "OrderPaid" for the same order, I had better make sure both events land in the same partition. The right key here is whatever entity needs ordering preserved, which is usually the customer ID or the aggregate ID, not the event ID.
+
+## Schemas, and why Avro is worth the pain
+
+The second hard lesson is that JSON over Kafka is a trap. It works great for the first six months, until you need to add a field to an event and you cannot remember which consumers are still on the old version, and one of them is silently dropping the new field, and another one is throwing exceptions, and now you have a half migrated topic with two implicit schemas living in production.
+
+Avro plus Confluent Schema Registry solves this. You write your schema in a `.avsc` file, register it with the registry, and the registry enforces compatibility rules at the broker level. You literally cannot publish a message with an incompatible schema.
+
+```json
 {
   "type": "record",
   "name": "OrderEvent",
   "namespace": "com.example.events",
   "fields": [
-    {"name": "orderId", "type": "string"},
-    {"name": "amount", "type": "double"},
-    {"name": "currency", "type": "string", "default": "USD"},
-    {"name": "metadata", "type": ["null", "string"], "default": null}
+    { "name": "orderId", "type": "string" },
+    { "name": "customerId", "type": "string" },
+    { "name": "amount", "type": "double" },
+    { "name": "currency", "type": "string", "default": "USD" },
+    { "name": "metadata", "type": ["null", "string"], "default": null }
   ]
 }
 ```
 
-The rules are simple: you can add fields with defaults, but you can't remove required fields or change types. Schema Registry enforces these rules at the broker level.
+The rules are simple once you internalize them:
 
-## Exactly-Once Semantics
+- **Adding a field** is fine, as long as it has a default. Old consumers ignore it, new consumers see it.
+- **Removing a field** is fine if the field had a default, because old messages still have it but new consumers can fall back to the default.
+- **Renaming a field** is *not* fine. Use aliases instead.
+- **Changing a field type** is almost never fine. Add a new field, deprecate the old one, migrate consumers, then remove.
 
-"Exactly once" is the holy grail of message processing. Kafka supports it through idempotent producers and transactional consumers:
+The discipline this enforces is annoying at first and then quickly becomes one of the most valuable things in your toolbox. I have seen teams spend weeks unwinding production incidents that a schema registry would have prevented at compile time.
 
-```java
-@Configuration
-public class KafkaConfig {
+A note on Protobuf: it works just as well as Avro for most use cases, and if your team is already using Protobuf for gRPC, the consistency is probably worth it. The point is not "use Avro," it is "use a schema, enforce it at the broker, and never trust JSON in a Kafka topic."
 
-    @Bean
-    public ProducerFactory<String, OrderEvent> producerFactory() {
-        Map<String, Object> props = new HashMap<>();
-        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
-        props.put(ProducerConfig.ACKS_CONFIG, "all");
-        props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "order-tx-");
-        return new DefaultKafkaProducerFactory<>(props);
-    }
-}
-```
+## Exactly once is real, but it is not magic
 
-But exactly-once within Kafka isn't enough — you also need exactly-once between Kafka and your database. The **transactional outbox pattern** handles this: write to your database and an outbox table in the same transaction, then publish events from the outbox.
+"Exactly once delivery" used to be a punchline among distributed systems people, because for a long time it was theoretically impossible. Kafka changed the conversation by introducing transactional producers and the read-process-write pattern, which give you exactly once *within Kafka*. The key word there is "within."
 
-## Dead Letter Queues
-
-Not every message can be processed. Poison pills, schema mismatches, or transient failures need a safety net:
+A transactional consumer looks like this:
 
 ```java
 @Bean
-public ConcurrentKafkaListenerContainerFactory<String, OrderEvent>
-        kafkaListenerContainerFactory() {
+public ProducerFactory<String, OrderEvent> producerFactory() {
+    Map<String, Object> props = new HashMap<>();
+    props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+    props.put(ProducerConfig.ACKS_CONFIG, "all");
+    props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "order-tx-");
+    return new DefaultKafkaProducerFactory<>(props);
+}
 
-    var factory = new ConcurrentKafkaListenerContainerFactory<>();
-    factory.setCommonErrorHandler(
-        new DefaultErrorHandler(
-            new DeadLetterPublishingRecoverer(kafkaTemplate),
-            new FixedBackOff(1000L, 3)
-        )
-    );
-    return factory;
+@KafkaListener(topics = "orders", containerFactory = "txListenerContainerFactory")
+@Transactional("kafkaTransactionManager")
+public void onOrderEvent(ConsumerRecord<String, OrderEvent> record) {
+    OrderEvent enriched = enrich(record.value());
+    kafkaTemplate.send("orders.enriched", enriched.getOrderId(), enriched);
 }
 ```
 
-This retries 3 times with 1-second backoff, then sends failed messages to a dead letter topic for investigation.
+The transaction wraps both the consume offset commit and the produce, so either both happen or neither does. This is genuinely exactly once *if your processing only touches Kafka*.
 
-## Resilience with Resilience4j
+But in real systems, your processing touches a database, or makes an HTTP call, or sends an email. Those side effects are not part of the Kafka transaction. So for end to end exactly once, you have a few options:
 
-Kafka consumers often call downstream services. Protect those calls with circuit breakers:
+1. **Make your processing idempotent.** This is by far the most common and most reliable answer. Use the message offset, the event ID, or a business key as a deduplication token, and check it before applying side effects. Deduplication tables are cheap, and they save you from a thousand headaches.
+2. **Use a transactional outbox on the consumer side too.** Same pattern as the producer, but now you are writing the result of processing to your database and an outbox in one transaction, and a downstream publisher takes care of Kafka.
+3. **Accept at least once and design downstream for it.** Often this is the right answer. If your downstream is idempotent, "at least once" is functionally equivalent to "exactly once" and a lot easier to reason about.
+
+The thing I want to drive home is: **do not chase exactly once as a goal.** Chase end to end correctness, and pick the simplest mechanism that gets you there.
+
+## Dead letter queues and why most teams set them up wrong
+
+Every Kafka pipeline needs a strategy for poison messages, but the typical "set up a DLQ topic" approach falls short in practice. Here are the failure modes I have seen:
+
+- **The DLQ topic exists, but nobody monitors it.** Messages pile up forever and nobody notices until a customer complains. Fix: alert on DLQ depth as a first class metric. If the depth is non zero for more than a few minutes, page somebody.
+- **Retries are unbounded.** A bad message gets retried forever, blocking the partition behind it. Fix: cap retries with a `FixedBackOff` or `ExponentialBackOff`, and send to the DLQ after the cap is hit.
+- **The DLQ schema is the same as the original topic.** When you eventually want to replay a DLQ message, you have lost all the context about *why* it failed and *when*. Fix: wrap the original payload in a DLQ envelope that includes the failure reason, the stack trace, the original topic and partition, and a timestamp.
+- **There is no replay tool.** Once messages are in the DLQ, the only way to reprocess them is to write a one off script every time. Fix: build a small CLI or admin endpoint that can selectively replay DLQ messages back to the original topic, with optional payload patching.
+
+A reasonable Spring Kafka error handler looks like this:
 
 ```java
-@CircuitBreaker(name = "inventory", fallbackMethod = "fallback")
-@Retry(name = "inventory")
+@Bean
+public DefaultErrorHandler errorHandler(KafkaTemplate<String, Object> template) {
+    DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(
+        template,
+        (record, ex) -> new TopicPartition(record.topic() + ".dlq", record.partition())
+    );
+    DefaultErrorHandler handler = new DefaultErrorHandler(
+        recoverer,
+        new ExponentialBackOff(1000L, 2.0)
+    );
+    handler.addNotRetryableExceptions(SerializationException.class);
+    return handler;
+}
+```
+
+Notice the `addNotRetryableExceptions`. Some failures are not transient and retrying them is just wasted work. Schema deserialization failures, validation errors, and "this user does not exist" errors should go straight to the DLQ.
+
+## Resilience4j: protecting your downstreams from your consumers
+
+A Kafka consumer is essentially an unbounded source of work. If your downstream service starts struggling, your consumer will happily hammer it harder until something breaks. Circuit breakers and rate limiters from Resilience4j prevent this:
+
+```java
+@CircuitBreaker(name = "inventoryService", fallbackMethod = "fallbackReserve")
+@Retry(name = "inventoryService")
+@Bulkhead(name = "inventoryService")
 public InventoryResponse reserveInventory(OrderEvent event) {
     return inventoryClient.reserve(event.getItems());
 }
+
+private InventoryResponse fallbackReserve(OrderEvent event, Throwable ex) {
+    log.warn("Inventory service unavailable, queuing for retry: {}", event.getOrderId(), ex);
+    retryQueue.enqueue(event);
+    return InventoryResponse.queued();
+}
 ```
 
-When the downstream service is struggling, the circuit breaker opens and fails fast instead of adding to the pile.
+The `@Bulkhead` is the often-overlooked one. It limits how many concurrent calls the consumer can have in flight against the downstream, which prevents a slow downstream from soaking up your entire consumer thread pool.
 
-## Monitoring and Observability
+A subtle but important point: when the circuit breaker is open, you have to decide whether to *commit the offset and skip*, or *not commit and retry later*. If you commit and skip, you need a retry queue (or a DLQ) to make sure the work eventually gets done. If you do not commit, your consumer will be stuck on that partition until the breaker closes, which can also be a problem if it blocks other messages behind it.
 
-In production, you need visibility into:
+## Observability is not optional
 
-- **Consumer lag** — how far behind are your consumers?
-- **Throughput** — messages per second per partition
-- **Error rates** — dead letter queue growth
-- **Processing latency** — time from produce to consume
+You cannot operate Kafka without metrics. The bare minimum I want to see on a dashboard for any production Kafka pipeline:
 
-We use Prometheus + Grafana with Spring Boot Actuator's Kafka metrics to monitor all of this.
+- **Consumer lag per consumer group, per partition.** This is your single most important metric. Lag growing means you are falling behind, and you have minutes to react before things start to back up.
+- **Throughput in messages per second**, broken out by topic and producer.
+- **Error rate**, broken out by error type. SerializationException is a different problem from a downstream timeout, and you want to be able to distinguish them at a glance.
+- **DLQ depth**, with an alert.
+- **End to end latency**, measured from the producer's `created_at` timestamp on the message to the consumer's processing timestamp.
 
----
+I usually export all of this with Micrometer to Prometheus, and visualize in Grafana. The Spring Boot Kafka actuator endpoints expose most of what you need; the consumer lag often needs a separate exporter like Burrow or kafka-lag-exporter.
 
-Event-driven architecture with Kafka is powerful but demands careful design around schemas, delivery guarantees, error handling, and monitoring. Get these right, and you have a system that scales gracefully and recovers from failures automatically.
+## A few more things I have learned the hard way
+
+Some smaller lessons that did not fit anywhere else but that I keep coming back to:
+
+- **Topic naming matters.** Pick a convention early and stick to it. Something like `domain.entity.event.version` works well. `orders.order.placed.v1` tells you everything you need to know.
+- **Versioned topics are your friend.** When you do a breaking schema change that the registry will not let you do in place, publish to a new versioned topic and migrate consumers gradually. Trying to evolve a topic in place is how you get stuck.
+- **Plan for partition count from day one.** You can increase partitions later, but it breaks ordering for any keys that get rehashed. Pick a number that gives you headroom for the next two years of growth.
+- **Compaction is not a backup.** Compacted topics are great for "current state" topics like user profiles, but they are not a substitute for snapshots or backups, and they make replay harder.
+- **Test with real Kafka in CI.** Embedded Kafka and Testcontainers both work well. Mocks lie. The number of bugs I have caught by running a real broker in tests is embarrassingly large.
+
+## Closing thoughts
+
+If you take one thing from this post, let it be this: **Kafka is a powerful tool, and like all powerful tools, most of its sharp edges are in the boring details.** The fun part is the architecture diagram with the events and the consumers and the arrows. The hard part is the schema discipline, the idempotency, the DLQ tooling, the observability, and the patient, careful work of making the whole pipeline reliable enough to forget about.
+
+I do not regret the time I have spent on those boring details. Every hour I have put into observability and schema enforcement has saved me ten hours of incident response. That is the trade off, and I will take it every time.

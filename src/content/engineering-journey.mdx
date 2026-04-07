@@ -1,67 +1,112 @@
-Six years into my software engineering career, I want to share some of the lessons I've picked up building distributed systems across very different industries — finance, healthcare, and telecom.
+It has been a little over six years since I wrote my first line of production Java, and I have spent most of that time building distributed systems for industries that, on the surface, do not have much in common: banking, healthcare, asset management, telecom, and now HR tech. I wanted to write this post partly as a reflection for myself, and partly because I keep getting asked the same question by friends and junior engineers: "what does it actually look like to grow as a backend engineer at a big company?" So here is the long version.
 
-## Starting in Finance
+## How I got started: HSBC and learning to take money seriously
 
-My first major engineering role was at HSBC, working on transaction processing systems. Banking taught me that **correctness is non-negotiable**. When you're processing millions of dollars in settlements, "eventually consistent" isn't good enough.
+My first real job out of school was at HSBC, working on a settlements and reconciliation platform. I joined as a Java Developer and immediately had to confront the fact that the codebase I was about to work on processed real money, sometimes hundreds of millions of dollars in a single batch window. Nobody handed me that responsibility on day one, of course, but the culture around the code made it very clear that "it works on my machine" was not going to fly.
 
-I learned to think deeply about:
+The first thing banking taught me was that **correctness is not negotiable**. In a side project, if your loop runs one extra iteration, you shrug and fix it. In settlements, if your loop runs one extra iteration, you have just double-paid a counterparty and somebody is on the phone with compliance. That mindset shift took me a few months to internalize, and it shaped how I write code to this day.
 
-- **Transaction isolation levels** — what happens when two operations touch the same account?
-- **Idempotency** — if a payment request is retried, it should not be charged twice
-- **Audit trails** — every state change must be traceable
+The technical skills I picked up there were the kind you do not appreciate until you need them:
 
-Spring Batch became my workhorse for high-volume batch processing. We'd process millions of transactions nightly, and the framework's restart, skip, and retry capabilities were essential.
+- **Transaction isolation levels.** I had read about READ_COMMITTED versus REPEATABLE_READ in textbooks, but it was not until I watched a phantom read corrupt a balance check in our integration environment that I really understood why isolation matters. We ended up using SERIALIZABLE for a small set of critical operations and accepting the throughput hit, because correctness was worth more than speed.
+- **Idempotency keys.** Every external request we sent had a deterministic key derived from the business operation, so retries were safe by construction. This sounds obvious in 2026, but in 2019 a lot of code I inherited still assumed the network was reliable.
+- **Audit trails.** Every state transition wrote a row to an immutable history table. When auditors came, we could replay exactly who changed what, when, and why. I have carried this pattern into every system I have built since.
+- **Spring Batch.** Our nightly job processed millions of transactions across dozens of steps, with restart, skip, and retry semantics built in. I learned to love `JobRepository`, `ItemReader`, and chunk-oriented processing. To this day, when somebody asks me "how would you process ten million records overnight," my brain reaches for Spring Batch before anything else.
 
-## Scaling in Healthcare
+I also got my first taste of frontend work at HSBC, building React components for an internal operations dashboard. It was not glamorous, but it taught me that the people who use internal tools deserve good UX too, and that "internal tool" is not an excuse for sloppy code.
 
-At Cardinal Health, the challenge shifted from financial correctness to **data interoperability**. Healthcare systems speak HL7 and FHIR — standards that are powerful but complex.
+## Cardinal Health: discovering that integration is its own discipline
 
-The key lesson here was building reliable integrations between systems that don't natively talk to each other. Event-driven patterns with AWS Lambda, S3, and SNS/SQS became the glue.
+After HSBC, I joined Cardinal Health and the problem space changed completely. Instead of moving money between two systems that we owned, I was moving healthcare data between systems that nobody fully owned. The whole industry runs on standards like HL7 v2, HL7 FHIR, X12, and a long tail of proprietary formats that vendors invented in the 1990s and never updated.
 
-Healthcare also reinforced the importance of **security and compliance**. HIPAA isn't just a checkbox — it fundamentally shapes how you design data flows, access controls, and audit logging.
+The hard part of healthcare engineering is not the code, it is the *interpretation*. Two hospitals can both send you a "valid" HL7 message and mean completely different things by the same field. I spent more time than I would like to admit reading vendor implementation guides, comparing them to the actual messages we were receiving, and writing translation layers. The technical work was largely event driven: AWS Lambda functions reacted to S3 uploads, parsed the incoming files, normalized them, and dropped events onto SNS topics that downstream consumers subscribed to via SQS.
 
-## Investing in Quality at Fidelity
+A few habits I formed at Cardinal that have stuck with me:
 
-At Fidelity Investments, I worked on portfolio valuation systems that needed to calculate real-time positions across thousands of accounts. The challenge was **performance under load**.
+1. **Never trust the schema, always validate the payload.** Vendors will lie. Validate at the boundary, fail loudly, and quarantine bad data so you can investigate later instead of corrupting your downstream state.
+2. **HIPAA is not just paperwork.** It changes how you log, how you store, how you encrypt, and even how you debug. You cannot just `System.out.println` a patient record to figure out what is going on. We built structured, redacted logging from the very first commit, and I have never gone back.
+3. **Idempotency, again.** Lambdas can fire twice. SQS can deliver twice. Design every consumer assuming "at least once" and you will sleep better.
 
-During high market-volume windows, our services needed to process massive parallel calculations. Java's `CompletableFuture` and careful thread pool management were critical:
+I also got my first real exposure to infrastructure as code at Cardinal. We managed Lambdas, IAM roles, and SNS topics through Terraform, and reviewing a Terraform plan before applying it became one of my favorite habits. There is something really satisfying about a clean diff that says "no changes, infrastructure matches configuration."
+
+## Fidelity: the year I fell in love with concurrency
+
+Fidelity Investments was where things got fast, in every sense of the word. I was building portfolio valuation services that needed to recalculate positions for tens of thousands of accounts during high market volume windows. The naive approach (loop through accounts, call the pricing service, save the result) fell over within minutes once the open bell hit.
+
+This was the project that made me really understand `CompletableFuture` and the JVM's thread pool model. The pattern we landed on looked something like this:
 
 ```java
+ExecutorService pricingPool = Executors.newFixedThreadPool(
+    Runtime.getRuntime().availableProcessors() * 2
+);
+
 List<CompletableFuture<Valuation>> futures = accounts.stream()
-    .map(account -> CompletableFuture.supplyAsync(
-        () -> calculateValuation(account),
-        executorService
-    ))
+    .map(account -> CompletableFuture
+        .supplyAsync(() -> pricingClient.fetch(account), pricingPool)
+        .thenApply(quote -> calculateValuation(account, quote))
+        .exceptionally(ex -> Valuation.failed(account, ex))
+    )
     .toList();
 
-CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+List<Valuation> results = futures.stream()
+    .map(CompletableFuture::join)
+    .toList();
 ```
 
-This is where I also started working with Python and FastAPI for ML-adjacent services — fraud risk scoring models that needed low-latency inference endpoints.
+The interesting part is not the parallelism itself, it is the failure handling. `exceptionally` lets you keep partial results when one account blows up, instead of failing the whole batch. We paired it with circuit breakers around the pricing service so that a single slow downstream did not poison the entire thread pool. Tuning the pool sizes, queue depths, and timeouts was an art that took a few production incidents to get right.
 
-## Telecom and the Scale Problem
+Fidelity is also where I picked up Python in earnest. Our risk team needed low latency fraud scoring endpoints that wrapped models trained by data scientists. FastAPI was the natural fit: fast to write, async by default, automatic OpenAPI docs, and friendly to people who were not full time backend engineers. I came away convinced that FastAPI is the right choice any time the people consuming your API also need to read your code.
 
-Comcast was a different beast. Subscriber-scale means millions of users, and the systems need to handle that volume with low latency. This is where I deepened my experience with:
+A few specific lessons from Fidelity:
 
-- **gRPC for inter-service communication** — binary protocol, strongly typed, much faster than REST for internal services
-- **GraphQL for frontend APIs** — let the UI request exactly what it needs
-- **Spring Cloud microservices** — service discovery, config server, API gateway
-- **ETL at scale** — AWS Glue + PySpark for processing terabytes of subscriber data
+- **Backpressure is real.** If your producer is faster than your consumer, you need a strategy. Bounded queues, semaphores, or reactive streams. Hope is not a strategy.
+- **Profile before you optimize.** I wasted a week optimizing a method that turned out to account for 0.4% of total runtime. Now I always start with a profiler.
+- **Talk to the business.** A finance system that returns the wrong answer in 10 ms is worse than one that returns the right answer in 100 ms. The product manager helped me understand which trade offs were acceptable.
 
-The biggest lesson from telecom: **observability is not optional at scale**. You can't debug a distributed system with print statements. Distributed tracing, structured logging, and metrics are table stakes.
+## Comcast: scale, in the literal sense
 
-## What I've Learned Along the Way
+Comcast was a step change. I was no longer building systems for thousands or even millions of users, I was building systems for *subscribers at the scale of a major US carrier*. That brings a few realities into sharp focus:
 
-Looking back, a few principles have served me well across every domain:
+- You cannot SSH into a server to debug. There is no "the server," there are hundreds of pods across multiple regions.
+- You cannot cache your way out of every problem, but you also cannot afford to skip caching anywhere it makes sense.
+- Cost matters. A 10% inefficiency in a service with billions of monthly requests is real money.
 
-1. **Understand the domain before writing code** — the best technical solution is useless if it doesn't solve the actual business problem
-2. **Design for failure** — distributed systems fail in creative ways. Circuit breakers, retries with backoff, dead letter queues, and graceful degradation aren't premature optimization — they're requirements
-3. **Keep it simple until you can't** — don't reach for Kafka when a database queue will do. Don't build microservices when a well-structured monolith would work. Complexity has a cost
-4. **Invest in testing** — integration tests that hit real databases and message brokers catch bugs that unit tests with mocks never will
-5. **Stay curious** — the field moves fast. LLMs, RAG pipelines, and vector databases weren't in my toolkit two years ago. Now they're central to my work at Paycom
+Most of my work at Comcast was on subscriber facing APIs built with Spring WebFlux. Reactive Java is a different mental model from imperative Java, and it took me a while to stop thinking in terms of "wait for this, then do that" and start thinking in terms of "describe the whole pipeline, then let the runtime schedule it." The payoff is that a single WebFlux instance can hold tens of thousands of concurrent connections without breaking a sweat, which mattered a lot when our SLA was measured in 99.9th percentile latency.
 
----
+Some of the patterns I leaned on heavily:
 
-Every industry teaches you something different. Finance teaches correctness. Healthcare teaches interoperability. Telecom teaches scale. The common thread is building systems that are reliable, maintainable, and designed to evolve.
+- **GraphQL on the edge, gRPC on the inside.** Mobile and web teams loved GraphQL because they could ask for exactly the fields they needed, which mattered on flaky cellular connections. Internally, we used gRPC with Protobuf contracts for service to service calls. It is faster, more strongly typed, and easier to evolve than REST and JSON when both sides of the wire are under your control.
+- **Spring Cloud for the boring parts.** Eureka for service discovery, Config Server for centralized configuration, and a gateway for routing and auth. Are these the most exciting tools? No. Do they let you focus on actual business logic instead of reinventing service registries? Yes.
+- **AWS Glue and PySpark for the data side.** We had ETL pipelines that processed terabytes of subscriber events nightly. Glue jobs gave us managed Spark with job bookmarks, and PySpark let the data engineers contribute without having to learn Scala.
+- **Refactoring a monolith.** I helped peel several bounded contexts out of an aging monolith into Spring Cloud microservices. The biggest lesson here was *do not start with the code*. Start with the domain. Identify the seams. Move data ownership last, because once two services share a database, you have not actually split anything.
 
-I'm excited about what comes next — especially at the intersection of AI and enterprise engineering. The tools are getting more powerful, and the problems are getting more interesting.
+The single biggest lesson from Comcast: **observability is not optional at scale**. Distributed tracing (we used a combination of Zipkin and AWS X-Ray), structured JSON logs with correlation IDs, and Prometheus metrics for everything. If you cannot see what your system is doing, you cannot fix it, and at scale you absolutely will need to fix something at 3 AM.
+
+## Paycom: the AI chapter, and where I am now
+
+These days I am at Paycom, building Spring Boot microservices on Java 17 and ECS Fargate, but the most interesting work has been on the AI side. I am building LLM powered features using LangChain, vector databases, and RAG pipelines that ground model responses in our own product data. It is the most fun I have had as an engineer in years, partly because the tools are new enough that the "right way" to do things is still being figured out, and partly because it sits at the intersection of two things I love: rigorous backend engineering and useful product features.
+
+A few things I have learned about AI engineering in the year or so I have been doing it seriously:
+
+- **The model is the easy part.** The hard part is the data pipeline, the evaluation, the prompt engineering, and the guardrails. Treat your RAG system like any other distributed system: instrument it, test it, version it.
+- **Latency budgets are tight.** Users expect AI responses in under a couple of seconds. That budget has to cover embedding the query, vector search, prompt assembly, the LLM call, and post processing. There is no room for sloppy code paths.
+- **Hallucinations happen, plan for them.** Always show sources. Always let the user push back. Never pretend the model is more confident than it is.
+
+I have also been deepening my Terraform and Kafka skills here, and getting more comfortable with event driven architectures at the application level (not just for ETL). It turns out that a lot of "AI features" are really just "good old event pipelines with a model call in the middle," which I find oddly comforting.
+
+## Principles I keep coming back to
+
+If I had to compress everything into a short list of principles that have served me across all of these jobs, it would look something like this:
+
+1. **Understand the domain before you write code.** The best technical solution is useless if it solves the wrong problem. Spend time with the people who will actually use what you are building.
+2. **Design for failure.** Distributed systems fail in creative, embarrassing ways. Circuit breakers, retries with exponential backoff, dead letter queues, idempotency keys, and graceful degradation are not premature optimization. They are the table stakes.
+3. **Keep it simple until you cannot.** Do not reach for Kafka when a database queue will do. Do not split into microservices when a well structured monolith would work. Complexity has a cost, and that cost compounds. The corollary: when you actually do need the complex tool, do not be precious about it. Use it.
+4. **Invest in tests that hit real things.** Unit tests with mocks are great for fast feedback, but they will not catch the migration that breaks your queries or the message format mismatch that explodes in staging. Spin up a real database and a real broker in your CI pipeline. Testcontainers is your friend.
+5. **Stay curious, on purpose.** The field moves fast. Two years ago, "vector database" was not in my vocabulary. Now it is central to my day job. Block out time every week for learning, even when nobody is asking you to.
+6. **Write things down.** Design docs, postmortems, internal blog posts, anything. Future you will thank present you. So will the engineer who joins six months after you leave.
+
+## What is next
+
+I am most excited about the intersection of classical backend engineering and AI. The companies that win the next decade are not going to be the ones with the cleverest model, they are going to be the ones with the cleverest *systems* that put models to work reliably. That means clean data pipelines, observable AI services, smart caching, principled evaluation, and humans in the loop where it matters. That is the work I want to keep doing.
+
+If any of this resonates, or if you are working on similar problems and want to swap notes, my contact info is on the home page. I love hearing from other engineers, especially folks earlier in their careers who are trying to figure out where to focus next. Six years in, I still feel like I am figuring it out too. That is part of the fun.

@@ -51,7 +51,7 @@ export default function Footer() {
 
         <div className="mt-8 pt-8 border-t border-white/5 text-center">
           <p className="text-muted text-sm flex items-center justify-center gap-1">
-            Made with <FaHeart className="text-crimson text-xs" /> by Prem Raj Oli
+            Made with <FaHeart className="text-crimson text-xs" /> by devpremoli
             &copy; {new Date().getFullYear()} {siteConfig.name}
           </p>
         </div>
