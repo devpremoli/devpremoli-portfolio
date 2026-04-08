@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Prem Raj Oli | Full-Stack Software Engineer",
   description:
-    "Portfolio of Prem Raj Oli — Full-Stack Software Engineer with 6+ years building cloud-native distributed systems across finance, healthcare, and telecom.",
+    "Portfolio of Prem Raj Oli, Full-Stack Software Engineer with 6+ years building cloud-native distributed systems across finance, healthcare, and telecom.",
   keywords: [
     "Prem Raj Oli",
     "Full Stack Software Engineer",

@@ -169,7 +169,7 @@ export const projects = [
   {
     title: "Pasale",
     description:
-      "Full-stack e-commerce platform where small businesses create shops and sell products — built with Spring Boot, React, Elasticsearch, Kafka, and an AI-powered product assistant using RAG.",
+      "Full-stack e-commerce platform where small businesses create shops and sell products, built with Spring Boot, React, Elasticsearch, Kafka, and an AI-powered product assistant using RAG.",
     image: "/projects/pasale.jpeg",
     technologies: [
       "Java 21",
@@ -191,7 +191,7 @@ export const projects = [
       longDescription:
         "Built a production-grade multi-vendor e-commerce platform where anyone can register, create multiple shops, and sell products. The backend is a Spring Boot API with stateless JWT authentication, Flyway-managed MySQL schema, Redis caching, Elasticsearch-powered product search with fuzzy matching, and Kafka for event-driven order processing and real-time notifications via SSE. The frontend is a React SPA with Redux Toolkit state management, guest cart with server sync on login, Google Places address autocomplete at checkout, and a responsive themed UI. An AI service built with FastAPI and LangChain provides a RAG-powered product assistant that answers customer questions using vector-embedded product data.",
       highlights: [
-        "Multi-vendor marketplace — unified registration, users create and manage multiple shops",
+        "Multi-vendor marketplace with unified registration, users create and manage multiple shops",
         "Event-driven order pipeline: Kafka consumers handle stock deduction and real-time SSE notifications",
         "Elasticsearch product search with fuzzy matching (AUTO:4,7 fuzziness, prefix-length gating)",
         "Stateless JWT auth with access/refresh token rotation and Spring Security 7 method-level authorization",

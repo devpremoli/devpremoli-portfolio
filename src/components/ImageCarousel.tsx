@@ -69,7 +69,7 @@ export default function ImageCarousel({
       {/* Overlay (gradient, badges, etc.) */}
       {overlay}
 
-      {/* Navigation arrows — only show if multiple images */}
+      {/* Navigation arrows, only show if multiple images */}
       {images.length > 1 && (
         <>
           <button
